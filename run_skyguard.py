@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PACKAGES = ["pyqt5", "opencv-python", "ultralytics", "numpy"]
+PACKAGES = ["pyqt5", "opencv-python", "ultralytics", "numpy", "pyttsx3"]
 
 
 def install_dependencies() -> None:

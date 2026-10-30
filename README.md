@@ -11,6 +11,9 @@ Sky-Guard is an enterprise Ground Control Station (GCS) and airspace monitoring 
 - **Auto-Zoom PiP**: A live crop of the highest-confidence detection in the command panel.
 - **Forensic Threat Gallery**: Saves one snapshot per track ID and source when confidence exceeds 85%, with timestamp, ID, class, and confidence metadata in `forensics/threats.sqlite3`.
 - **HUD & Telemetry**: Live FPS, tracking counters, lock state, and alert siren.
+- **Voice Alerts**: Speech-synthesized target acquisition and geofence breach alerts, handled on a dedicated thread.
+- **Swarm Warning**: Flashing on-feed warning and event-log entry when three or more targets are tracked.
+- **Simulated Motion Metrics**: Per-target approximate distance and centroid-based speed, clearly labeled as simulated.
 - **Authentication**: Secure operator login window.
 - **Dark/Light Mode**: Dynamic theme switching.
 - **Reporting**: Event logging and report exporting to CSV.
@@ -37,6 +40,13 @@ the video, then choose **FINISH FENCE**. Use **UNDO POINT** to correct the last
 vertex, or toggle drawing off to cancel and restore the previous fence. Geofence
 detection is paused while drawing; the saved polygon and on/off setting persist
 between launches.
+
+Voice alerts use `pyttsx3` on a dedicated thread; if the speech engine is unavailable,
+the app logs that status while video and tracking continue. The on-feed swarm warning
+appears when at least three detections are active and is logged once per swarm event.
+Distance is estimated as `100000 / box area` meters and speed from centroid motion
+using an illustrative `0.05 m/pixel` scale. These are demo-only values, not calibrated
+measurements or real-world telemetry.
 
 ## Quick Start
 

@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import queue
 import sqlite3
 import sys
 import time
@@ -76,6 +77,8 @@ CRIMSON_BGR = (60, 20, 220)
 LABEL_BG = (0, 0, 0)
 NO_FLY_ZONE = ((0.66, 0.22), (0.94, 0.22), (0.94, 0.78), (0.66, 0.78))
 FORENSIC_CONFIDENCE = 0.85
+SIMULATED_DISTANCE_AREA_SCALE = 100_000.0
+SIMULATED_METERS_PER_PIXEL = 0.05
 
 DARK = {
     "bg": "#0b1220",
@@ -310,7 +313,9 @@ def draw_target_label(frame, text, x, y, color):
     font = cv2.FONT_HERSHEY_DUPLEX
     scale, thick = 1.2, 2
     (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
-    x, y = int(x), int(max(th + 8, y))
+    h, w = frame.shape[:2]
+    x = max(4, min(int(x), w - tw - 4))
+    y = max(th + 8, min(int(y), h - 4))
     cv2.rectangle(frame, (x - 4, y - th - 8), (x + tw + 4, y + 6), LABEL_BG, -1)
     cv2.putText(frame, text, (x, y), font, scale, color, thick, cv2.LINE_AA)
 
@@ -444,6 +449,54 @@ def write_fallback_icon(path: Path) -> None:
     cv2.imwrite(str(path), img)
 
 
+class VoiceAlertWorker(QThread):
+    """Run speech synthesis away from the GUI and video-inference threads."""
+
+    status_event = pyqtSignal(str)
+    _STOP = object()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._messages = queue.Queue()
+
+    def speak(self, message: str):
+        if self.isRunning():
+            self._messages.put(message)
+
+    def stop(self):
+        if self.isRunning():
+            self._messages.put(self._STOP)
+
+    def run(self):
+        try:
+            import pyttsx3
+
+            engine = pyttsx3.init()
+        except Exception as exc:
+            self.status_event.emit(f"> VOICE ALERTS OFFLINE  {exc}")
+            return
+
+        try:
+            engine.setProperty("rate", 175)
+            self.status_event.emit("> VOICE ALERTS READY")
+            while True:
+                message = self._messages.get()
+                if message is self._STOP:
+                    break
+                try:
+                    engine.say(message)
+                    engine.runAndWait()
+                except Exception as exc:
+                    self.status_event.emit(f"> VOICE ALERT FAILED  {exc}")
+        except Exception as exc:
+            self.status_event.emit(f"> VOICE ALERTS OFFLINE  {exc}")
+        finally:
+            try:
+                engine.stop()
+            except Exception as exc:
+                self.status_event.emit(f"> VOICE ENGINE STOP FAILED  {exc}")
+
+
 class InferenceWorker(QThread):
     """Vision pipeline. YOLO is constructed once; only VideoCapture is hot-swapped."""
 
@@ -455,6 +508,7 @@ class InferenceWorker(QThread):
     pip_frame_ready = pyqtSignal(object)
     geofence_alert = pyqtSignal(bool, str)
     forensic_saved = pyqtSignal(dict)
+    voice_alert = pyqtSignal(str)
 
     def __init__(self, base_dir: Path, forensic_store=None, parent=None):
         super().__init__(parent)
@@ -478,6 +532,9 @@ class InferenceWorker(QThread):
         self.trajectories = defaultdict(lambda: deque(maxlen=30))
         self.geofence_inside = set()
         self.geofence_config = (True, NO_FLY_ZONE, False)
+        self.previous_centers = {}
+        self.seen_target_ids = set()
+        self.swarm_active = False
         self.forensic_saved_ids = set()
         self.forensic_retry_after = {}
 
@@ -544,6 +601,9 @@ class InferenceWorker(QThread):
                 self.locked_id = None
                 self.trajectories.clear()
                 self.geofence_inside.clear()
+                self.previous_centers.clear()
+                self.seen_target_ids.clear()
+                self.swarm_active = False
                 self.forensic_saved_ids.clear()
                 self.forensic_retry_after.clear()
                 self.geofence_alert.emit(False, "")
@@ -570,6 +630,10 @@ class InferenceWorker(QThread):
                 persist = False
                 self.trajectories.clear()
                 self.geofence_inside.clear()
+                self.previous_centers.clear()
+                seen_ids.clear()
+                self.seen_target_ids.clear()
+                self.swarm_active = False
                 self.geofence_alert.emit(False, "")
                 continue
 
@@ -602,6 +666,9 @@ class InferenceWorker(QThread):
                                 tid = hash((label, int((x1 + x2) / 2) // 80)) & 0x7FFFFFFF
                                 log_key = ("cls", label)
                             tracks.append((tid, label, conf, x1, y1, x2, y2))
+                            if tid not in self.seen_target_ids:
+                                self.seen_target_ids.add(tid)
+                                self.voice_alert.emit("Target Acquired")
                             if log_key not in seen_ids:
                                 seen_ids.add(log_key)
                                 self.detection_event.emit(
@@ -609,6 +676,15 @@ class InferenceWorker(QThread):
                                 )
                 except Exception as exc:
                     self.detection_event.emit(f"> INFERENCE FAULT  {exc}")
+
+            swarm_detected = len(tracks) >= 3
+            if swarm_detected and not self.swarm_active:
+                self.detection_event.emit(
+                    f"> CRITICAL: SWARM DETECTED  targets={len(tracks)}"
+                )
+            elif self.swarm_active and not swarm_detected:
+                self.detection_event.emit("> SWARM CLEAR")
+            self.swarm_active = swarm_detected
 
             h, w = frame.shape[:2]
             geofence_enabled, geofence_points, geofence_editing = self.geofence_config
@@ -629,6 +705,7 @@ class InferenceWorker(QThread):
                             self.detection_event.emit(
                                 f"> NO-FLY ZONE BREACH  id={tid}  {label}"
                             )
+                            self.voice_alert.emit("Warning: Airspace Breach")
                             self.geofence_alert.emit(
                                 True,
                                 f"NO-FLY ZONE BREACH  |  ID {tid}  {label.upper()}",
@@ -643,11 +720,30 @@ class InferenceWorker(QThread):
             for tid in tuple(self.trajectories):
                 if tid not in active_ids:
                     del self.trajectories[tid]
+            for tid in tuple(self.previous_centers):
+                if tid not in active_ids:
+                    del self.previous_centers[tid]
+            frame_time = time.perf_counter()
+            metrics_by_id = {}
             for track in tracks:
                 tid, _label, confidence, x1, y1, x2, y2 = track
-                self.trajectories[tid].append(
-                    (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                )
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                self.trajectories[tid].append((int(center_x), int(center_y)))
+                area = max(1.0, float((x2 - x1) * (y2 - y1)))
+                distance_m = SIMULATED_DISTANCE_AREA_SCALE / area
+                previous = self.previous_centers.get(tid)
+                speed_kmh = 0.0
+                if previous is not None:
+                    prev_x, prev_y, prev_time = previous
+                    elapsed = frame_time - prev_time
+                    if elapsed > 0:
+                        displacement_px = math.hypot(center_x - prev_x, center_y - prev_y)
+                        speed_kmh = (
+                            displacement_px * SIMULATED_METERS_PER_PIXEL / elapsed * 3.6
+                        )
+                self.previous_centers[tid] = (center_x, center_y, frame_time)
+                metrics_by_id[tid] = (distance_m, speed_kmh)
                 if (
                     confidence > FORENSIC_CONFIDENCE
                     and self.forensic_store is not None
@@ -782,6 +878,39 @@ class InferenceWorker(QThread):
                     x1,
                     y1 - 12,
                     color,
+                )
+                distance_m, speed_kmh = metrics_by_id[tid]
+                draw_target_label(
+                    vis,
+                    f"SIM  DIST {distance_m:.1f}m  |  SPD {speed_kmh:.1f}km/h",
+                    x1,
+                    y2 + 28,
+                    color,
+                )
+
+            if self.swarm_active and int(time.perf_counter() * 4) % 2 == 0:
+                warning = f"CRITICAL: SWARM DETECTED  ({len(tracks)} TARGETS)"
+                font = cv2.FONT_HERSHEY_DUPLEX
+                scale, thickness = 0.9, 2
+                text_size, _ = cv2.getTextSize(warning, font, scale, thickness)
+                text_x = max(12, (vis.shape[1] - text_size[0]) // 2)
+                text_y = max(40, min(112, vis.shape[0] - 16))
+                cv2.rectangle(
+                    vis,
+                    (text_x - 10, text_y - text_size[1] - 10),
+                    (text_x + text_size[0] + 10, text_y + 8),
+                    (0, 0, 180),
+                    -1,
+                )
+                cv2.putText(
+                    vis,
+                    warning,
+                    (text_x, text_y),
+                    font,
+                    scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA,
                 )
 
             if tracks:
@@ -1032,6 +1161,9 @@ class MainWindow(QMainWindow):
         self.worker.pip_frame_ready.connect(self.on_pip_frame)
         self.worker.geofence_alert.connect(self.on_geofence_alert)
         self.worker.forensic_saved.connect(self.on_forensic_saved)
+        self.voice_worker = VoiceAlertWorker(self)
+        self.worker.voice_alert.connect(self.voice_worker.speak)
+        self.voice_worker.status_event.connect(self.append_log)
 
         self.siren_timer = QTimer(self)
         self.siren_timer.setInterval(400)
@@ -1055,6 +1187,7 @@ class MainWindow(QMainWindow):
             )
         elif self.forensic_store is not None:
             self.load_gallery()
+        self.voice_worker.start()
         self.worker.start()
 
     def _build_ui(self):
@@ -1796,6 +1929,8 @@ class MainWindow(QMainWindow):
         self.siren_timer.stop()
         self.worker.stop()
         self.worker.wait(2500)
+        self.voice_worker.stop()
+        self.voice_worker.wait(5000)
         event.accept()
 
 
