@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import math
 import os
 import platform
+import sqlite3
 import sys
 import time
+import uuid
+from collections import defaultdict, deque
+from contextlib import closing
 from datetime import datetime
 from importlib.util import find_spec
 from pathlib import Path
@@ -30,7 +35,7 @@ if platform.system() == "Windows":
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -67,6 +72,8 @@ AUTH_PASS = "admin123"
 CYAN_BGR = (255, 255, 0)
 CRIMSON_BGR = (60, 20, 220)
 LABEL_BG = (0, 0, 0)
+NO_FLY_ZONE = ((0.66, 0.22), (0.94, 0.22), (0.94, 0.78), (0.66, 0.78))
+FORENSIC_CONFIDENCE = 0.85
 
 DARK = {
     "bg": "#121212",
@@ -297,6 +304,105 @@ def bgr_to_qimage(frame) -> QImage:
     return QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
 
 
+def apply_display_mode(frame, mode: str):
+    if mode == "night":
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        lut = np.clip((np.arange(256, dtype=np.float32) - 48) * 1.65, 0, 255).astype(np.uint8)
+        green = cv2.LUT(gray, lut)
+        blue = (green.astype(np.float32) * 0.08).astype(np.uint8)
+        red = (green.astype(np.float32) * 0.025).astype(np.uint8)
+        return cv2.merge((blue, green, red))
+    if mode == "thermal":
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+    return frame.copy()
+
+
+def crop_target(frame, track):
+    _tid, _label, _conf, x1, y1, x2, y2 = track
+    h, w = frame.shape[:2]
+    box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
+    pad_x, pad_y = box_w * 0.25, box_h * 0.25
+    left = max(0, int(x1 - pad_x))
+    top = max(0, int(y1 - pad_y))
+    right = min(w, int(x2 + pad_x))
+    bottom = min(h, int(y2 + pad_y))
+    if right <= left or bottom <= top:
+        return None
+    return frame[top:bottom, left:right]
+
+
+class ForensicStore:
+    """SQLite metadata and image storage for high-confidence detections."""
+
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.directory = base_dir / "forensics"
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.database_path = self.directory / "threats.sqlite3"
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS detections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        target_id INTEGER NOT NULL,
+                        target_class TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        image_path TEXT NOT NULL
+                    )
+                    """
+                )
+
+    def save(self, frame, track):
+        target_id, label, confidence, *_box = track
+        crop = crop_target(frame, track)
+        if crop is None or crop.size == 0:
+            raise ValueError(f"Cannot crop target {target_id}: its bounding box is empty")
+        filename = f"threat_{uuid.uuid4().hex}.jpg"
+        image_path = self.directory / filename
+        if not cv2.imwrite(str(image_path), crop):
+            raise OSError(f"Could not write forensic snapshot: {image_path}")
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        relative_path = image_path.relative_to(self.base_dir).as_posix()
+        try:
+            with closing(sqlite3.connect(self.database_path)) as connection:
+                with connection:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO detections
+                            (timestamp, target_id, target_class, confidence, image_path)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (timestamp, int(target_id), str(label), float(confidence), relative_path),
+                    )
+                    entry_id = cursor.lastrowid
+        except sqlite3.Error:
+            image_path.unlink(missing_ok=True)
+            raise
+        return {
+            "id": entry_id,
+            "timestamp": timestamp,
+            "target_id": int(target_id),
+            "target_class": str(label),
+            "confidence": float(confidence),
+            "image_path": relative_path,
+        }
+
+    def entries(self):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT id, timestamp, target_id, target_class, confidence, image_path
+                FROM detections
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def write_fallback_icon(path: Path) -> None:
     img = np.zeros((256, 256, 3), dtype=np.uint8)
     img[:] = (18, 18, 18)
@@ -317,10 +423,14 @@ class InferenceWorker(QThread):
     status_event = pyqtSignal(str)
     tracks_updated = pyqtSignal(list)
     telemetry = pyqtSignal(dict)
+    pip_frame_ready = pyqtSignal(object)
+    geofence_alert = pyqtSignal(bool, str)
+    forensic_saved = pyqtSignal(dict)
 
-    def __init__(self, base_dir: Path, parent=None):
+    def __init__(self, base_dir: Path, forensic_store=None, parent=None):
         super().__init__(parent)
         self.base_dir = base_dir
+        self.forensic_store = forensic_store
         self._running = True
         self.pan = 50
         self.tilt = 50
@@ -335,6 +445,11 @@ class InferenceWorker(QThread):
         self.click_norm = None
         self.model = None
         self._model_ready = False
+        self.display_mode = "normal"
+        self.trajectories = defaultdict(lambda: deque(maxlen=30))
+        self.geofence_inside = set()
+        self.forensic_saved_ids = set()
+        self.forensic_retry_after = {}
 
     def stop(self):
         self._running = False
@@ -390,12 +505,18 @@ class InferenceWorker(QThread):
                 seen_ids.clear()
                 persist = False
                 self.locked_id = None
+                self.trajectories.clear()
+                self.geofence_inside.clear()
+                self.forensic_saved_ids.clear()
+                self.forensic_retry_after.clear()
+                self.geofence_alert.emit(False, "")
                 continue
 
             if cap is None:
                 blank = np.zeros((720, 1280, 3), dtype=np.uint8)
                 cv2.putText(blank, "NO SIGNAL", (400, 370), cv2.FONT_HERSHEY_DUPLEX, 1.6, CRIMSON_BGR, 2)
                 self.frame_ready.emit(bgr_to_qimage(blank))
+                self.pip_frame_ready.emit(None)
                 self.msleep(80)
                 continue
 
@@ -410,6 +531,9 @@ class InferenceWorker(QThread):
                     continue
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 persist = False
+                self.trajectories.clear()
+                self.geofence_inside.clear()
+                self.geofence_alert.emit(False, "")
                 continue
 
             tracks = []
@@ -449,6 +573,62 @@ class InferenceWorker(QThread):
                 except Exception as exc:
                     self.detection_event.emit(f"> INFERENCE FAULT  {exc}")
 
+            h, w = frame.shape[:2]
+            zone = np.array(
+                [[int(x * w), int(y * h)] for x, y in NO_FLY_ZONE],
+                dtype=np.int32,
+            )
+            previous_inside = self.geofence_inside
+            current_inside = set()
+            for track in tracks:
+                tid, label, _conf, x1, y1, x2, y2 = track
+                center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                if cv2.pointPolygonTest(zone, center, False) >= 0:
+                    current_inside.add(tid)
+                    if tid not in previous_inside:
+                        self.detection_event.emit(
+                            f"> NO-FLY ZONE BREACH  id={tid}  {label}"
+                        )
+                        self.geofence_alert.emit(
+                            True,
+                            f"NO-FLY ZONE BREACH  |  ID {tid}  {label.upper()}",
+                        )
+            for tid in previous_inside - current_inside:
+                self.detection_event.emit(f"> NO-FLY ZONE CLEAR  id={tid}")
+            if previous_inside and not current_inside:
+                self.geofence_alert.emit(False, "")
+            self.geofence_inside = current_inside
+
+            active_ids = {track[0] for track in tracks}
+            for tid in tuple(self.trajectories):
+                if tid not in active_ids:
+                    del self.trajectories[tid]
+            for track in tracks:
+                tid, _label, confidence, x1, y1, x2, y2 = track
+                self.trajectories[tid].append(
+                    (int((x1 + x2) / 2), int((y1 + y2) / 2))
+                )
+                if (
+                    confidence > FORENSIC_CONFIDENCE
+                    and self.forensic_store is not None
+                    and tid not in self.forensic_saved_ids
+                    and time.monotonic() >= self.forensic_retry_after.get(tid, 0)
+                ):
+                    try:
+                        entry = self.forensic_store.save(frame, track)
+                    except (OSError, sqlite3.Error, ValueError, cv2.error) as exc:
+                        self.forensic_retry_after[tid] = time.monotonic() + 5
+                        self.detection_event.emit(
+                            f"> FORENSIC SNAPSHOT FAILED  id={tid}  {exc}"
+                        )
+                    else:
+                        self.forensic_saved_ids.add(tid)
+                        self.forensic_retry_after.pop(tid, None)
+                        self.forensic_saved.emit(entry)
+                        self.detection_event.emit(
+                            f"> FORENSIC SNAPSHOT SAVED  id={tid}  {confidence * 100:.0f}%"
+                        )
+
             if self.click_norm is not None and tracks:
                 nx, ny = self.click_norm
                 self.click_norm = None
@@ -472,19 +652,67 @@ class InferenceWorker(QThread):
             if self.locked_id is not None and self.locked_id not in live:
                 self.locked_id = None
 
+            vis = apply_display_mode(frame, self.display_mode)
+            overlay = vis.copy()
+            cv2.fillPoly(overlay, [zone], CRIMSON_BGR)
+            alpha = (
+                0.14 + 0.16 * (0.5 + 0.5 * math.sin(time.perf_counter() * 6))
+                if current_inside
+                else 0.12
+            )
+            vis = cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0)
+            cv2.polylines(vis, [zone], True, CRIMSON_BGR, 2, cv2.LINE_AA)
+            zone_x, zone_y = zone[0]
+            cv2.putText(
+                vis,
+                "NO-FLY ZONE",
+                (int(zone_x), max(20, int(zone_y) - 8)),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.6,
+                CRIMSON_BGR,
+                2,
+                cv2.LINE_AA,
+            )
+
+            for points in self.trajectories.values():
+                if len(points) < 2:
+                    continue
+                path = list(points)
+                for index in range(1, len(path)):
+                    brightness = 0.25 + 0.75 * index / (len(path) - 1)
+                    color = tuple(int(channel * brightness) for channel in CYAN_BGR)
+                    cv2.polylines(
+                        vis,
+                        [np.array(path[index - 1:index + 1], dtype=np.int32)],
+                        False,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+
             for t in tracks:
                 tid, label, conf, x1, y1, x2, y2 = t
                 color = CRIMSON_BGR if tid == self.locked_id else CYAN_BGR
-                draw_corner_brackets(frame, x1, y1, x2, y2, color, thickness=3)
+                draw_corner_brackets(vis, x1, y1, x2, y2, color, thickness=3)
                 draw_target_label(
-                    frame,
+                    vis,
                     f"ID {tid}  {label.upper()}  {conf * 100:.0f}%",
                     x1,
                     y1 - 12,
                     color,
                 )
 
-            vis = apply_ptz(frame, self.pan, self.tilt, self.zoom)
+            if tracks:
+                pip_crop = crop_target(frame, max(tracks, key=lambda track: track[2]))
+                self.pip_frame_ready.emit(
+                    bgr_to_qimage(apply_display_mode(pip_crop, self.display_mode))
+                    if pip_crop is not None
+                    else None
+                )
+            else:
+                self.pip_frame_ready.emit(None)
+
+            vis = apply_ptz(vis, self.pan, self.tilt, self.zoom)
             now = time.perf_counter()
             inst = 1.0 / max(now - t_prev, 1e-6)
             t_prev = now
@@ -668,17 +896,26 @@ class MainWindow(QMainWindow):
         self.event_rows = []
         self.custom_files = []
         self._block_source = False
+        self.forensic_store = None
+        self.forensic_storage_error = None
+        try:
+            self.forensic_store = ForensicStore(self.base_dir)
+        except (OSError, sqlite3.Error) as exc:
+            self.forensic_storage_error = str(exc)
 
         self.setWindowTitle("Sky-Guard  |  Airspace Monitoring GCS")
         self.setWindowIcon(QIcon("icon.png"))
         self.resize(1560, 900)
 
-        self.worker = InferenceWorker(self.base_dir)
+        self.worker = InferenceWorker(self.base_dir, self.forensic_store)
         self.worker.frame_ready.connect(self.on_frame)
         self.worker.detection_event.connect(self.append_log)
         self.worker.status_event.connect(self.on_status)
         self.worker.tracks_updated.connect(self.on_tracks)
         self.worker.telemetry.connect(self.on_telemetry)
+        self.worker.pip_frame_ready.connect(self.on_pip_frame)
+        self.worker.geofence_alert.connect(self.on_geofence_alert)
+        self.worker.forensic_saved.connect(self.on_forensic_saved)
 
         self.siren_timer = QTimer(self)
         self.siren_timer.setInterval(400)
@@ -688,6 +925,15 @@ class MainWindow(QMainWindow):
         self.apply_theme()
         self.populate_sources()
         self.append_log("> SESSION  operator authenticated")
+        if self.forensic_storage_error:
+            self.append_log(f"> FORENSIC STORAGE OFFLINE  {self.forensic_storage_error}")
+            QMessageBox.warning(
+                self,
+                "Forensic storage unavailable",
+                f"Threat snapshots cannot be saved:\n{self.forensic_storage_error}",
+            )
+        elif self.forensic_store is not None:
+            self.load_gallery()
         self.worker.start()
 
     def _build_ui(self):
@@ -740,10 +986,38 @@ class MainWindow(QMainWindow):
         right_l.addWidget(head)
         right_l.addWidget(self.lock_state)
 
+        optics = QHBoxLayout()
+        self.night_btn = QPushButton("🟢 NIGHT VISION")
+        self.night_btn.setCheckable(True)
+        self.night_btn.toggled.connect(self.toggle_night_vision)
+        self.thermal_btn = QPushButton("🔥 THERMAL FLIR")
+        self.thermal_btn.setCheckable(True)
+        self.thermal_btn.toggled.connect(self.toggle_thermal)
+        optics.addWidget(self.night_btn)
+        optics.addWidget(self.thermal_btn)
+        right_l.addLayout(optics)
+
+        pip_title = QLabel("AUTO-ZOOM  |  HIGHEST CONFIDENCE")
+        pip_title.setObjectName("section")
+        self.pip_view = QLabel("NO ACTIVE TARGET")
+        self.pip_view.setAlignment(Qt.AlignCenter)
+        self.pip_view.setMinimumHeight(150)
+        self.pip_view.setMaximumHeight(210)
+        self.pip_view.setStyleSheet("background:#000; color:#9aa0a6;")
+        self.warning_label = QLabel("GEOFENCE CLEAR")
+        self.warning_label.setAlignment(Qt.AlignCenter)
+        self.warning_label.setStyleSheet(
+            "background:#18351f; color:#83d58e; padding:7px; font-weight:700;"
+        )
+        right_l.addWidget(pip_title)
+        right_l.addWidget(self.pip_view)
+        right_l.addWidget(self.warning_label)
+
         tabs = QTabWidget()
         tabs.addTab(self._ops_tab(), "Operations")
         tabs.addTab(self._tracks_tab(), "Tracks")
         tabs.addTab(self._log_tab(), "Event Log")
+        tabs.addTab(self._gallery_tab(), "Threat Gallery")
         right_l.addWidget(tabs, 1)
 
         splitter.addWidget(left)
@@ -863,6 +1137,15 @@ class MainWindow(QMainWindow):
         col.addWidget(clear)
         return page
 
+    def _gallery_tab(self) -> QWidget:
+        page = QWidget()
+        col = QVBoxLayout(page)
+        self.gallery = QListWidget()
+        self.gallery.setIconSize(QSize(128, 72))
+        self.gallery.setSpacing(6)
+        col.addWidget(self.gallery)
+        return page
+
     def apply_theme(self):
         self.theme = DARK if self.theme_name == "dark" else LIGHT
         self.setStyleSheet(stylesheet(self.theme))
@@ -926,6 +1209,24 @@ class MainWindow(QMainWindow):
         self.track_btn.setText("Tracking On" if on else "Tracking Off")
         self.append_log("> TRACKING  " + ("enabled" if on else "disabled"))
 
+    def toggle_night_vision(self, on: bool):
+        if on:
+            self.thermal_btn.setChecked(False)
+            self.worker.display_mode = "night"
+            self.append_log("> OPTICS  night vision enabled")
+        elif not self.thermal_btn.isChecked():
+            self.worker.display_mode = "normal"
+            self.append_log("> OPTICS  normal display")
+
+    def toggle_thermal(self, on: bool):
+        if on:
+            self.night_btn.setChecked(False)
+            self.worker.display_mode = "thermal"
+            self.append_log("> OPTICS  thermal FLIR enabled")
+        elif not self.night_btn.isChecked():
+            self.worker.display_mode = "normal"
+            self.append_log("> OPTICS  normal display")
+
     def on_slider(self, name: str, value: int, label: QLabel):
         label.setText(str(value))
         self.worker.pan = self.pan.slider.value()
@@ -936,6 +1237,59 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def on_frame(self, image: QImage):
         self.video.set_frame(image)
+
+    @pyqtSlot(object)
+    def on_pip_frame(self, image):
+        if image is None or image.isNull():
+            self.pip_view.clear()
+            self.pip_view.setText("NO ACTIVE TARGET")
+            return
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.pip_view.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.pip_view.setPixmap(pixmap)
+
+    @pyqtSlot(bool, str)
+    def on_geofence_alert(self, active: bool, message: str):
+        if active:
+            self.warning_label.setText(message)
+            self.warning_label.setStyleSheet(
+                "background:#7f1d1d; color:#ffffff; padding:7px; font-weight:700;"
+            )
+        else:
+            self.warning_label.setText("GEOFENCE CLEAR")
+            self.warning_label.setStyleSheet(
+                "background:#18351f; color:#83d58e; padding:7px; font-weight:700;"
+            )
+
+    @pyqtSlot(dict)
+    def on_forensic_saved(self, entry: dict):
+        self.add_gallery_entry(entry)
+
+    def load_gallery(self):
+        if self.forensic_store is None:
+            return
+        try:
+            entries = self.forensic_store.entries()
+        except sqlite3.Error as exc:
+            self.append_log(f"> THREAT GALLERY LOAD FAILED  {exc}")
+            return
+        for entry in reversed(entries):
+            self.add_gallery_entry(entry)
+
+    def add_gallery_entry(self, entry: dict):
+        image_path = self.base_dir / entry["image_path"]
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            self.append_log(f"> THREAT GALLERY IMAGE MISSING  {image_path}")
+        details = (
+            f"{entry['timestamp']}  |  ID {entry['target_id']}  |  "
+            f"{entry['target_class']}  |  {entry['confidence'] * 100:.0f}%"
+        )
+        item = QListWidgetItem(QIcon(pixmap), details)
+        self.gallery.insertItem(0, item)
 
     @pyqtSlot(str)
     def on_status(self, text: str):

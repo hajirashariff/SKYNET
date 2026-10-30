@@ -24,3 +24,4 @@ desktop.ini
 *.log
 video_logs/
 skyguard_report_*.csv
+forensics/
