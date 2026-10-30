@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import json
 import math
 import os
 import platform
@@ -35,8 +36,8 @@ if platform.system() == "Windows":
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, QSettings, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -55,6 +56,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSplitter,
+    QShortcut,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -76,24 +78,24 @@ NO_FLY_ZONE = ((0.66, 0.22), (0.94, 0.22), (0.94, 0.78), (0.66, 0.78))
 FORENSIC_CONFIDENCE = 0.85
 
 DARK = {
-    "bg": "#121212",
-    "surface": "#1e1e1e",
-    "accent": "#007acc",
-    "text": "#ffffff",
-    "muted": "#9aa0a6",
-    "border": "#2a2a2a",
-    "danger": "#d13438",
-    "input": "#252525",
+    "bg": "#0b1220",
+    "surface": "#111c2d",
+    "accent": "#38bdf8",
+    "text": "#e6edf7",
+    "muted": "#a7b5c8",
+    "border": "#2a3a50",
+    "danger": "#ef5350",
+    "input": "#162337",
 }
 LIGHT = {
-    "bg": "#f3f3f3",
+    "bg": "#eef3f8",
     "surface": "#ffffff",
-    "accent": "#007acc",
-    "text": "#1a1a1a",
-    "muted": "#5f6368",
-    "border": "#d6d6d6",
-    "danger": "#c42b1c",
-    "input": "#ffffff",
+    "accent": "#075e8b",
+    "text": "#142235",
+    "muted": "#455b73",
+    "border": "#c7d4e2",
+    "danger": "#a51d24",
+    "input": "#f7faff",
 }
 
 
@@ -101,45 +103,49 @@ def app_icon() -> QIcon:
     return QIcon("icon.png") if Path("icon.png").exists() else QIcon(str(ICON_FILE))
 
 
-def stylesheet(theme: dict) -> str:
+def stylesheet(theme: dict, font_scale: float = 1.0) -> str:
+    font_size = round(14 * font_scale)
     return f"""
     QWidget {{
         background: {theme['bg']};
         color: {theme['text']};
         font-family: 'Segoe UI', sans-serif;
-        font-size: 13px;
+        font-size: {font_size}px;
     }}
     QMainWindow, QDialog {{ background: {theme['bg']}; }}
     QFrame#surface, QFrame#card {{
         background: {theme['surface']};
         border: 1px solid {theme['border']};
-        border-radius: 6px;
+        border-radius: 10px;
     }}
     QLabel#title {{
         color: {theme['text']};
-        font-size: 22px;
+        font-size: {round(24 * font_scale)}px;
         font-weight: 600;
         letter-spacing: 0.5px;
     }}
     QLabel#subtitle {{
         color: {theme['muted']};
-        font-size: 12px;
+        font-size: {round(13 * font_scale)}px;
     }}
     QLabel#section {{
         color: {theme['accent']};
-        font-size: 11px;
+        font-size: {round(12 * font_scale)}px;
         font-weight: 700;
-        letter-spacing: 1.4px;
+        letter-spacing: 1px;
     }}
     QLineEdit, QComboBox {{
         background: {theme['input']};
         color: {theme['text']};
         border: 1px solid {theme['border']};
-        border-radius: 4px;
+        border-radius: 7px;
         padding: 8px 10px;
-        min-height: 20px;
+        min-height: 24px;
     }}
-    QLineEdit:focus, QComboBox:focus {{ border: 1px solid {theme['accent']}; }}
+    QLineEdit:focus, QComboBox:focus {{
+        border: 2px solid {theme['accent']};
+        padding: 7px 9px;
+    }}
     QComboBox QAbstractItemView {{
         background: {theme['surface']};
         color: {theme['text']};
@@ -150,21 +156,28 @@ def stylesheet(theme: dict) -> str:
         background: {theme['surface']};
         color: {theme['text']};
         border: 1px solid {theme['border']};
-        border-radius: 4px;
-        padding: 8px 14px;
+        border-radius: 7px;
+        padding: 9px 14px;
+        min-height: 22px;
         font-weight: 600;
     }}
-    QPushButton:hover {{ border-color: {theme['accent']}; color: {theme['accent']}; }}
+    QPushButton:hover {{
+        background: {theme['input']};
+        border-color: {theme['accent']};
+    }}
+    QPushButton:focus {{
+        border: 2px solid {theme['accent']};
+    }}
     QPushButton:pressed {{ background: {theme['input']}; }}
     QPushButton#primary {{
         background: {theme['accent']};
-        color: #ffffff;
+        color: {theme['bg']};
         border: 1px solid {theme['accent']};
     }}
-    QPushButton#primary:hover {{ background: #1b8bd4; }}
+    QPushButton#primary:hover {{ background: #7dd3fc; color: #082033; }}
     QPushButton:checked {{
         background: {theme['accent']};
-        color: #ffffff;
+        color: {theme['bg']};
         border: 1px solid {theme['accent']};
     }}
     QPushButton#danger:checked {{
@@ -175,23 +188,32 @@ def stylesheet(theme: dict) -> str:
     QTabWidget::pane {{
         background: {theme['surface']};
         border: 1px solid {theme['border']};
+        border-radius: 7px;
     }}
     QTabBar::tab {{
         background: {theme['bg']};
         color: {theme['muted']};
-        padding: 8px 16px;
-        border: 1px solid {theme['border']};
+        padding: 10px 12px;
+        border: 1px solid transparent;
+        border-radius: 6px;
     }}
     QTabBar::tab:selected {{
         color: {theme['text']};
         background: {theme['surface']};
-        border-bottom: 2px solid {theme['accent']};
+        border: 1px solid {theme['border']};
+        border-bottom: 3px solid {theme['accent']};
+    }}
+    QTabBar::tab:focus {{
+        border: 2px solid {theme['accent']};
     }}
     QTableWidget {{
         background: {theme['surface']};
         color: {theme['text']};
         gridline-color: {theme['border']};
         border: 1px solid {theme['border']};
+        alternate-background-color: {theme['input']};
+        selection-background-color: {theme['accent']};
+        selection-color: {theme['bg']};
     }}
     QHeaderView::section {{
         background: {theme['bg']};
@@ -201,27 +223,34 @@ def stylesheet(theme: dict) -> str:
         font-weight: 600;
     }}
     QListWidget {{
-        background: {theme['bg']};
+        background: {theme['surface']};
         color: {theme['text']};
         border: 1px solid {theme['border']};
-        font-family: Consolas, 'Cascadia Mono', monospace;
-        font-size: 12px;
+        border-radius: 7px;
+        font-family: 'Segoe UI', sans-serif;
+        font-size: {round(13 * font_scale)}px;
         padding: 6px;
     }}
     QSlider::groove:horizontal {{
-        height: 4px;
+        height: 6px;
         background: {theme['border']};
         border-radius: 2px;
     }}
     QSlider::handle:horizontal {{
         background: {theme['accent']};
-        width: 14px;
-        margin: -6px 0;
-        border-radius: 7px;
+        width: 18px;
+        margin: -7px 0;
+        border-radius: 9px;
+        border: 2px solid {theme['surface']};
     }}
     QSlider::sub-page:horizontal {{ background: {theme['accent']}; }}
-    QScrollBar:vertical {{ background: {theme['bg']}; width: 10px; }}
-    QScrollBar::handle:vertical {{ background: {theme['border']}; border-radius: 4px; }}
+    QScrollBar:vertical {{ background: {theme['bg']}; width: 12px; margin: 2px; }}
+    QScrollBar::handle:vertical {{ background: {theme['border']}; border-radius: 6px; min-height: 28px; }}
+    QStatusBar {{
+        background: {theme['surface']};
+        color: {theme['muted']};
+        border-top: 1px solid {theme['border']};
+    }}
     """
 
 
@@ -448,6 +477,7 @@ class InferenceWorker(QThread):
         self.display_mode = "normal"
         self.trajectories = defaultdict(lambda: deque(maxlen=30))
         self.geofence_inside = set()
+        self.geofence_config = (True, NO_FLY_ZONE, False)
         self.forensic_saved_ids = set()
         self.forensic_retry_after = {}
 
@@ -460,6 +490,13 @@ class InferenceWorker(QThread):
 
     def request_click(self, nx: float, ny: float):
         self.click_norm = (nx, ny)
+
+    def set_geofence(self, enabled: bool, points, editing: bool = False):
+        self.geofence_config = (
+            bool(enabled),
+            tuple((float(x), float(y)) for x, y in points),
+            bool(editing),
+        )
 
     def _init_model_once(self):
         if self._model_ready:
@@ -574,25 +611,28 @@ class InferenceWorker(QThread):
                     self.detection_event.emit(f"> INFERENCE FAULT  {exc}")
 
             h, w = frame.shape[:2]
+            geofence_enabled, geofence_points, geofence_editing = self.geofence_config
             zone = np.array(
-                [[int(x * w), int(y * h)] for x, y in NO_FLY_ZONE],
+                [[int(x * w), int(y * h)] for x, y in geofence_points],
                 dtype=np.int32,
-            )
+            ).reshape((-1, 1, 2))
+            fence_active = geofence_enabled and not geofence_editing and len(zone) >= 3
             previous_inside = self.geofence_inside
             current_inside = set()
-            for track in tracks:
-                tid, label, _conf, x1, y1, x2, y2 = track
-                center = ((x1 + x2) / 2, (y1 + y2) / 2)
-                if cv2.pointPolygonTest(zone, center, False) >= 0:
-                    current_inside.add(tid)
-                    if tid not in previous_inside:
-                        self.detection_event.emit(
-                            f"> NO-FLY ZONE BREACH  id={tid}  {label}"
-                        )
-                        self.geofence_alert.emit(
-                            True,
-                            f"NO-FLY ZONE BREACH  |  ID {tid}  {label.upper()}",
-                        )
+            if fence_active:
+                for track in tracks:
+                    tid, label, _conf, x1, y1, x2, y2 = track
+                    center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                    if cv2.pointPolygonTest(zone, center, False) >= 0:
+                        current_inside.add(tid)
+                        if tid not in previous_inside:
+                            self.detection_event.emit(
+                                f"> NO-FLY ZONE BREACH  id={tid}  {label}"
+                            )
+                            self.geofence_alert.emit(
+                                True,
+                                f"NO-FLY ZONE BREACH  |  ID {tid}  {label.upper()}",
+                            )
             for tid in previous_inside - current_inside:
                 self.detection_event.emit(f"> NO-FLY ZONE CLEAR  id={tid}")
             if previous_inside and not current_inside:
@@ -653,26 +693,68 @@ class InferenceWorker(QThread):
                 self.locked_id = None
 
             vis = apply_display_mode(frame, self.display_mode)
-            overlay = vis.copy()
-            cv2.fillPoly(overlay, [zone], CRIMSON_BGR)
-            alpha = (
-                0.14 + 0.16 * (0.5 + 0.5 * math.sin(time.perf_counter() * 6))
-                if current_inside
-                else 0.12
-            )
-            vis = cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0)
-            cv2.polylines(vis, [zone], True, CRIMSON_BGR, 2, cv2.LINE_AA)
-            zone_x, zone_y = zone[0]
-            cv2.putText(
-                vis,
-                "NO-FLY ZONE",
-                (int(zone_x), max(20, int(zone_y) - 8)),
-                cv2.FONT_HERSHEY_DUPLEX,
-                0.6,
-                CRIMSON_BGR,
-                2,
-                cv2.LINE_AA,
-            )
+            if len(zone):
+                if fence_active:
+                    overlay = vis.copy()
+                    cv2.fillPoly(overlay, [zone], CRIMSON_BGR)
+                    alpha = (
+                        0.14 + 0.16 * (0.5 + 0.5 * math.sin(time.perf_counter() * 6))
+                        if current_inside
+                        else 0.12
+                    )
+                    vis = cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0)
+                    fence_color = CRIMSON_BGR
+                elif geofence_editing:
+                    fence_color = (0, 190, 255)
+                else:
+                    fence_color = (128, 128, 128)
+
+                if len(zone) >= 2:
+                    cv2.polylines(
+                        vis,
+                        [zone],
+                        fence_active or (not geofence_editing and len(zone) >= 3),
+                        fence_color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                for index, (point_x, point_y) in enumerate(zone.reshape((-1, 2)), start=1):
+                    center = (int(point_x), int(point_y))
+                    cv2.circle(vis, center, 6, fence_color, -1, cv2.LINE_AA)
+                    if geofence_editing:
+                        cv2.putText(
+                            vis,
+                            str(index),
+                            (center[0] + 8, center[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            fence_color,
+                            2,
+                            cv2.LINE_AA,
+                        )
+                if not geofence_editing and len(zone) >= 3:
+                    zone_x, zone_y = zone[0, 0]
+                    cv2.putText(
+                        vis,
+                        "NO-FLY ZONE" if fence_active else "GEOFENCE OFF",
+                        (int(zone_x), max(20, int(zone_y) - 8)),
+                        cv2.FONT_HERSHEY_DUPLEX,
+                        0.6,
+                        fence_color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+            elif geofence_editing:
+                cv2.putText(
+                    vis,
+                    "DRAW FENCE: CLICK VIDEO TO ADD POINTS",
+                    (18, 106),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.65,
+                    (0, 190, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             for points in self.trajectories.values():
                 if len(points) < 2:
@@ -891,11 +973,43 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.theme_name = theme_name
         self.theme = DARK if theme_name == "dark" else LIGHT
+        self.font_scale = 1.0
+        self.feed_status_text = "INITIALIZING"
         self.base_dir = APP_DIR
+        self.settings = QSettings("Sky-Guard", "GCS")
+        self.geofence_enabled = self.settings.value("geofence/enabled", True, type=bool)
+        self.geofence_points = NO_FLY_ZONE
+        self.geofence_settings_error = None
+        raw_points = self.settings.value("geofence/points", "")
+        if raw_points:
+            try:
+                configured_points = json.loads(raw_points)
+                if not isinstance(configured_points, list) or any(
+                    not isinstance(point, (list, tuple)) or len(point) != 2
+                    for point in configured_points
+                ):
+                    raise ValueError("Saved geofence points must be coordinate pairs")
+                normalized_points = tuple(
+                    (float(point[0]), float(point[1])) for point in configured_points
+                )
+                if (
+                    len(normalized_points) < 3
+                    or any(
+                        len(point) != 2
+                        or not all(math.isfinite(value) and 0 <= value <= 1 for value in point)
+                        for point in normalized_points
+                    )
+                ):
+                    raise ValueError("Saved geofence must contain at least three normalized points")
+                self.geofence_points = normalized_points
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self.geofence_settings_error = str(exc)
         self.latest_tracks = []
         self.event_rows = []
         self.custom_files = []
         self._block_source = False
+        self.editing_geofence = False
+        self._saved_geofence_points = self.geofence_points
         self.forensic_store = None
         self.forensic_storage_error = None
         try:
@@ -905,9 +1019,11 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Sky-Guard  |  Airspace Monitoring GCS")
         self.setWindowIcon(QIcon("icon.png"))
+        self.setMinimumSize(1180, 720)
         self.resize(1560, 900)
 
         self.worker = InferenceWorker(self.base_dir, self.forensic_store)
+        self.worker.set_geofence(self.geofence_enabled, self.geofence_points)
         self.worker.frame_ready.connect(self.on_frame)
         self.worker.detection_event.connect(self.append_log)
         self.worker.status_event.connect(self.on_status)
@@ -922,9 +1038,14 @@ class MainWindow(QMainWindow):
         self.siren_timer.timeout.connect(self._pulse_siren)
 
         self._build_ui()
+        self._install_shortcuts()
         self.apply_theme()
         self.populate_sources()
         self.append_log("> SESSION  operator authenticated")
+        if self.geofence_settings_error:
+            self.append_log(
+                f"> GEOFENCE SETTINGS INVALID  using default polygon  {self.geofence_settings_error}"
+            )
         if self.forensic_storage_error:
             self.append_log(f"> FORENSIC STORAGE OFFLINE  {self.forensic_storage_error}")
             QMessageBox.warning(
@@ -941,57 +1062,89 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
 
         top = QHBoxLayout()
+        top.setSpacing(10)
         brand = QLabel("SKY-GUARD")
         brand.setObjectName("title")
-        self.status_label = QLabel("INITIALIZING")
+        self.status_label = QLabel("●  INITIALIZING")
         self.status_label.setObjectName("subtitle")
+        self.status_label.setAccessibleName("Video feed status")
         self.stats_label = QLabel("FPS --")
         self.stats_label.setObjectName("subtitle")
-        self.theme_btn = QPushButton("LIGHT MODE")
+        self.stats_label.setAccessibleName("Live performance and tracking status")
+        self.theme_btn = QPushButton("LIGHT THEME")
+        self.theme_btn.setAccessibleName("Switch color theme")
+        self.theme_btn.setToolTip("Switch between dark and light themes (Ctrl+Shift+D)")
         self.theme_btn.clicked.connect(self.toggle_theme)
+        self.font_down_btn = QPushButton("A−")
+        self.font_down_btn.setAccessibleName("Decrease text size")
+        self.font_down_btn.setToolTip("Decrease interface text size (Ctrl+-)")
+        self.font_down_btn.clicked.connect(lambda: self.change_font_size(-0.1))
+        self.font_size_label = QLabel("100%")
+        self.font_size_label.setObjectName("subtitle")
+        self.font_size_label.setAccessibleName("Current interface text scale")
+        self.font_up_btn = QPushButton("A+")
+        self.font_up_btn.setAccessibleName("Increase text size")
+        self.font_up_btn.setToolTip("Increase interface text size (Ctrl+=)")
+        self.font_up_btn.clicked.connect(lambda: self.change_font_size(0.1))
+        self.help_btn = QPushButton("SHORTCUTS")
+        self.help_btn.setAccessibleName("Show keyboard shortcuts")
+        self.help_btn.setToolTip("Show keyboard shortcuts and accessibility controls")
+        self.help_btn.clicked.connect(self.show_shortcuts)
         top.addWidget(brand)
         top.addSpacing(16)
         top.addWidget(self.status_label, 1)
         top.addWidget(self.stats_label)
+        top.addWidget(self.font_down_btn)
+        top.addWidget(self.font_size_label)
+        top.addWidget(self.font_up_btn)
+        top.addWidget(self.help_btn)
         top.addWidget(self.theme_btn)
         layout.addLayout(top)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
         layout.addWidget(splitter, 1)
 
         left = QFrame()
         left.setObjectName("surface")
         left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(10, 10, 10, 10)
-        left_l.setSpacing(8)
+        left_l.setContentsMargins(12, 12, 12, 12)
+        left_l.setSpacing(10)
 
         self.video = VideoView()
-        self.video.clicked.connect(self.worker.request_click)
+        self.video.clicked.connect(self.on_video_clicked)
         left_l.addWidget(self.video, 1)
         left_l.addWidget(self._media_bar())
         left_l.addWidget(self._gimbal_bar())
 
         right = QFrame()
         right.setObjectName("surface")
-        right.setMinimumWidth(360)
+        right.setMinimumWidth(350)
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(12, 12, 12, 12)
+        right_l.setSpacing(8)
         head = QLabel("COMMAND")
         head.setObjectName("section")
         self.lock_state = QLabel("LOCK  STANDBY")
         self.lock_state.setObjectName("subtitle")
+        self.lock_state.setAccessibleName("Current target lock status")
         right_l.addWidget(head)
         right_l.addWidget(self.lock_state)
 
         optics = QHBoxLayout()
         self.night_btn = QPushButton("🟢 NIGHT VISION")
         self.night_btn.setCheckable(True)
+        self.night_btn.setAccessibleName("Toggle night vision display")
+        self.night_btn.setToolTip("Toggle phosphor-green night-vision display")
         self.night_btn.toggled.connect(self.toggle_night_vision)
         self.thermal_btn = QPushButton("🔥 THERMAL FLIR")
         self.thermal_btn.setCheckable(True)
+        self.thermal_btn.setAccessibleName("Toggle thermal display")
+        self.thermal_btn.setToolTip("Toggle thermal color-map display")
         self.thermal_btn.toggled.connect(self.toggle_thermal)
         optics.addWidget(self.night_btn)
         optics.addWidget(self.thermal_btn)
@@ -1003,9 +1156,12 @@ class MainWindow(QMainWindow):
         self.pip_view.setAlignment(Qt.AlignCenter)
         self.pip_view.setMinimumHeight(150)
         self.pip_view.setMaximumHeight(210)
+        self.pip_view.setAccessibleName("Auto-zoom preview of the highest-confidence detection")
         self.pip_view.setStyleSheet("background:#000; color:#9aa0a6;")
         self.warning_label = QLabel("GEOFENCE CLEAR")
         self.warning_label.setAlignment(Qt.AlignCenter)
+        self.warning_label.setAccessibleName("Geofence warning status")
+        self.warning_label.setMinimumHeight(38)
         self.warning_label.setStyleSheet(
             "background:#18351f; color:#83d58e; padding:7px; font-weight:700;"
         )
@@ -1013,7 +1169,47 @@ class MainWindow(QMainWindow):
         right_l.addWidget(self.pip_view)
         right_l.addWidget(self.warning_label)
 
+        fence_controls = QHBoxLayout()
+        self.geofence_btn = QPushButton("GEOFENCE ON")
+        self.geofence_btn.setCheckable(True)
+        self.geofence_btn.setChecked(self.geofence_enabled)
+        self.geofence_btn.setAccessibleName("Enable or disable the geofence")
+        self.geofence_btn.setToolTip("Toggle no-fly zone detection and its video overlay")
+        self.geofence_btn.toggled.connect(self.toggle_geofence)
+        self.edit_fence_btn = QPushButton("DRAW FENCE")
+        self.edit_fence_btn.setCheckable(True)
+        self.edit_fence_btn.setAccessibleName("Draw a custom geofence on the video")
+        self.edit_fence_btn.setToolTip(
+            "Click at least three points on the video to define a custom polygon"
+        )
+        self.edit_fence_btn.toggled.connect(self.toggle_geofence_edit)
+        fence_controls.addWidget(self.geofence_btn)
+        fence_controls.addWidget(self.edit_fence_btn)
+
+        fence_edit_controls = QHBoxLayout()
+        self.undo_fence_btn = QPushButton("UNDO POINT")
+        self.undo_fence_btn.setAccessibleName("Remove the most recent fence point")
+        self.undo_fence_btn.setEnabled(False)
+        self.undo_fence_btn.clicked.connect(self.undo_geofence_point)
+        self.finish_fence_btn = QPushButton("FINISH FENCE")
+        self.finish_fence_btn.setObjectName("primary")
+        self.finish_fence_btn.setAccessibleName("Finish and save the custom fence")
+        self.finish_fence_btn.setEnabled(False)
+        self.finish_fence_btn.clicked.connect(self.finish_geofence_edit)
+        fence_edit_controls.addWidget(self.undo_fence_btn)
+        fence_edit_controls.addWidget(self.finish_fence_btn)
+
+        self.fence_hint = QLabel("Enable the fence or draw a custom polygon")
+        self.fence_hint.setObjectName("subtitle")
+        self.fence_hint.setWordWrap(True)
+        self.fence_hint.setAccessibleName("Geofence drawing instructions")
+        right_l.addLayout(fence_controls)
+        right_l.addLayout(fence_edit_controls)
+        right_l.addWidget(self.fence_hint)
+
         tabs = QTabWidget()
+        tabs.setAccessibleName("Command panel sections")
+        tabs.setDocumentMode(True)
         tabs.addTab(self._ops_tab(), "Operations")
         tabs.addTab(self._tracks_tab(), "Tracks")
         tabs.addTab(self._log_tab(), "Event Log")
@@ -1024,6 +1220,57 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 7)
         splitter.setStretchFactor(1, 3)
+        splitter.setSizes([1090, 430])
+
+        shortcuts_hint = QLabel(
+            "Ctrl+Shift+P  Pause  ·  Ctrl+Shift+T  Tracking  ·  "
+            "Ctrl+Shift+D  Theme  ·  Ctrl +/-  Text  ·  F11  Full screen"
+        )
+        shortcuts_hint.setObjectName("subtitle")
+        shortcuts_hint.setAccessibleName("Keyboard shortcut summary")
+        shortcuts_hint.setAlignment(Qt.AlignCenter)
+        self.statusBar().addPermanentWidget(shortcuts_hint, 1)
+
+    def _install_shortcuts(self):
+        shortcuts = (
+            ("Ctrl+Shift+P", lambda: self.play_btn.toggle()),
+            ("Ctrl+Shift+T", lambda: self.track_btn.toggle()),
+            ("Ctrl+Shift+D", self.toggle_theme),
+            ("Ctrl+=", lambda: self.change_font_size(0.1)),
+            ("Ctrl+-", lambda: self.change_font_size(-0.1)),
+            ("F11", self.toggle_fullscreen),
+        )
+        for sequence, callback in shortcuts:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(callback)
+
+    def change_font_size(self, amount: float):
+        self.font_scale = min(1.4, max(0.9, round(self.font_scale + amount, 1)))
+        self.font_size_label.setText(f"{round(self.font_scale * 100)}%")
+        self.font_size_label.setAccessibleDescription(
+            f"Interface text size {round(self.font_scale * 100)} percent"
+        )
+        self.apply_theme()
+
+    def show_shortcuts(self):
+        QMessageBox.information(
+            self,
+            "Keyboard shortcuts",
+            "Ctrl+Shift+P  Pause or resume the feed\n"
+            "Ctrl+Shift+T  Toggle tracking\n"
+            "Ctrl+Shift+D  Switch dark or light theme\n"
+            "Ctrl+= / Ctrl+-  Change interface text size\n"
+            "F11  Toggle full screen\n\n"
+            "The same controls are available as on-screen buttons. "
+            "Use Tab and Shift+Tab to move between controls.",
+        )
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
     def _media_bar(self) -> QWidget:
         bar = QFrame()
@@ -1035,20 +1282,28 @@ class MainWindow(QMainWindow):
         label = QLabel("SOURCE")
         label.setObjectName("section")
         self.source_combo = QComboBox()
+        self.source_combo.setAccessibleName("Video or camera source")
+        self.source_combo.setToolTip("Choose a video file or camera")
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
 
         browse = QPushButton("Browse")
+        browse.setAccessibleName("Browse for a video file")
         browse.clicked.connect(self.browse_video)
         webcam = QPushButton("Webcam")
+        webcam.setAccessibleName("Select webcam")
         webcam.clicked.connect(self.use_webcam)
 
         self.play_btn = QPushButton("Pause")
         self.play_btn.setCheckable(True)
+        self.play_btn.setAccessibleName("Pause video feed")
+        self.play_btn.setToolTip("Pause or resume the feed (Ctrl+Shift+P)")
         self.play_btn.toggled.connect(self.toggle_pause)
 
         self.track_btn = QPushButton("Tracking On")
         self.track_btn.setCheckable(True)
         self.track_btn.setChecked(True)
+        self.track_btn.setAccessibleName("Toggle object tracking")
+        self.track_btn.setToolTip("Enable or disable tracking (Ctrl+Shift+T)")
         self.track_btn.toggled.connect(self.toggle_tracking)
 
         row.addWidget(label)
@@ -1087,6 +1342,8 @@ class MainWindow(QMainWindow):
         slider = QSlider(Qt.Horizontal)
         slider.setRange(0, 100)
         slider.setValue(value)
+        slider.setAccessibleName(f"{name.title()} adjustment")
+        slider.setAccessibleDescription(f"Adjust {name.lower()} from 0 to 100")
         slider.valueChanged.connect(lambda v, n=name, lab=val: self.on_slider(n, v, lab))
         col.addLayout(header)
         col.addWidget(slider)
@@ -1100,12 +1357,16 @@ class MainWindow(QMainWindow):
         self.siren_btn = QPushButton("Alert Siren")
         self.siren_btn.setObjectName("danger")
         self.siren_btn.setCheckable(True)
+        self.siren_btn.setAccessibleName("Toggle alert siren")
         self.siren_btn.toggled.connect(self.toggle_siren)
         lock_btn = QPushButton("Manual Lock")
+        lock_btn.setAccessibleName("Lock the highest-confidence active target")
         lock_btn.clicked.connect(self.manual_lock)
         dismiss_btn = QPushButton("Dismiss Threat")
+        dismiss_btn.setAccessibleName("Dismiss the current target lock")
         dismiss_btn.clicked.connect(self.dismiss_threat)
         export_btn = QPushButton("Export Report")
+        export_btn.setAccessibleName("Export the event log to a report")
         export_btn.clicked.connect(self.export_report)
         hint = QLabel("Click a tracked object in the video to lock.\nVideos loop automatically at end of tape.")
         hint.setObjectName("subtitle")
@@ -1123,6 +1384,8 @@ class MainWindow(QMainWindow):
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.track_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.track_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.track_table.setAlternatingRowColors(True)
+        self.track_table.setAccessibleName("Currently tracked objects")
         self.track_table.cellClicked.connect(self.lock_from_table)
         col.addWidget(self.track_table)
         return page
@@ -1148,9 +1411,21 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self):
         self.theme = DARK if self.theme_name == "dark" else LIGHT
-        self.setStyleSheet(stylesheet(self.theme))
-        self.theme_btn.setText("LIGHT MODE" if self.theme_name == "dark" else "DARK MODE")
+        self.setStyleSheet(stylesheet(self.theme, self.font_scale))
+        self.theme_btn.setText("LIGHT THEME" if self.theme_name == "dark" else "DARK THEME")
         self.video.setStyleSheet(f"background:#000; color:{self.theme['muted']};")
+        self._style_feed_status()
+
+    def _style_feed_status(self):
+        if self.feed_status_text.startswith("FEED ONLINE"):
+            color = "#4ade80" if self.theme_name == "dark" else "#176b37"
+        elif self.feed_status_text.startswith(("NO SIGNAL", "FEED OFFLINE")):
+            color = self.theme["danger"]
+        else:
+            color = self.theme["accent"]
+        self.status_label.setText(f"●  {self.feed_status_text}")
+        self.status_label.setStyleSheet(f"color:{color}; font-weight:600;")
+        self.status_label.setToolTip(self.feed_status_text)
 
     def toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
@@ -1198,6 +1473,151 @@ class MainWindow(QMainWindow):
 
     def use_webcam(self):
         self.source_combo.setCurrentIndex(0)
+
+    def on_video_clicked(self, nx: float, ny: float):
+        if not self.editing_geofence:
+            self.worker.request_click(nx, ny)
+            return
+
+        zoom_scale = 1.0 + (self.worker.zoom / 100.0) * 2.5
+        pan_offset = (self.worker.pan / 100.0) * (1.0 - 1.0 / zoom_scale)
+        tilt_offset = (self.worker.tilt / 100.0) * (1.0 - 1.0 / zoom_scale)
+        source_x = min(1.0, max(0.0, pan_offset + nx / zoom_scale))
+        source_y = min(1.0, max(0.0, tilt_offset + ny / zoom_scale))
+        self.geofence_points = (*self.geofence_points, (source_x, source_y))
+        self.worker.set_geofence(self.geofence_enabled, self.geofence_points, editing=True)
+        self._update_fence_edit_controls()
+        self.append_log(
+            f"> GEOFENCE POINT {len(self.geofence_points)}  "
+            f"{source_x:.3f}, {source_y:.3f}"
+        )
+
+    def toggle_geofence(self, enabled: bool):
+        self.geofence_enabled = enabled
+        self.geofence_btn.setText("GEOFENCE ON" if enabled else "GEOFENCE OFF")
+        self.settings.setValue("geofence/enabled", enabled)
+        self._save_geofence_settings()
+        self.worker.set_geofence(
+            self.geofence_enabled,
+            self.geofence_points,
+            editing=self.editing_geofence,
+        )
+        self._refresh_geofence_status()
+        self.append_log(f"> GEOFENCE  {'enabled' if enabled else 'disabled'}")
+
+    def toggle_geofence_edit(self, editing: bool):
+        if editing:
+            self._saved_geofence_points = self.geofence_points
+            self.geofence_points = ()
+            self.editing_geofence = True
+            self.worker.set_geofence(self.geofence_enabled, self.geofence_points, editing=True)
+            self.append_log("> GEOFENCE  drawing started; click video to add vertices")
+        elif self.editing_geofence:
+            self.editing_geofence = False
+            self.geofence_points = self._saved_geofence_points
+            self.worker.set_geofence(self.geofence_enabled, self.geofence_points)
+            self.append_log("> GEOFENCE  drawing cancelled")
+
+        self._update_fence_edit_controls()
+        self._refresh_geofence_status()
+
+    def _update_fence_edit_controls(self):
+        count = len(self.geofence_points)
+        self.undo_fence_btn.setEnabled(self.editing_geofence and count > 0)
+        self.finish_fence_btn.setEnabled(self.editing_geofence and count >= 3)
+        if self.editing_geofence:
+            self.fence_hint.setText(
+                f"Click the video to add vertices  ·  {count} point"
+                f"{'' if count == 1 else 's'}  ·  at least 3 required"
+            )
+        elif self.geofence_enabled:
+            self.fence_hint.setText(
+                f"Fence active  ·  {len(self.geofence_points)} saved vertices"
+            )
+        else:
+            self.fence_hint.setText("Fence disabled  ·  draw a custom polygon any time")
+
+    def _refresh_geofence_status(self, active=False, message=""):
+        if active:
+            self.warning_label.setText(message)
+            self.warning_label.setStyleSheet(
+                "background:#7f1d1d; color:#ffffff; padding:7px; font-weight:700;"
+            )
+        elif self.editing_geofence:
+            self.warning_label.setText(
+                f"DRAWING FENCE  ·  {len(self.geofence_points)} POINTS"
+            )
+            self.warning_label.setStyleSheet(
+                "background:#674512; color:#ffffff; padding:7px; font-weight:700;"
+            )
+        elif self.geofence_enabled:
+            self.warning_label.setText("GEOFENCE ON  ·  CLEAR")
+            self.warning_label.setStyleSheet(
+                "background:#18351f; color:#83d58e; padding:7px; font-weight:700;"
+            )
+        else:
+            self.warning_label.setText("GEOFENCE OFF")
+            self.warning_label.setStyleSheet(
+                f"background:{self.theme['input']}; color:{self.theme['muted']}; "
+                "padding:7px; font-weight:700;"
+            )
+
+    def undo_geofence_point(self):
+        if not self.editing_geofence or not self.geofence_points:
+            return
+        self.geofence_points = self.geofence_points[:-1]
+        self.worker.set_geofence(self.geofence_enabled, self.geofence_points, editing=True)
+        self._update_fence_edit_controls()
+        self._refresh_geofence_status()
+        self.append_log(f"> GEOFENCE  removed last point  {len(self.geofence_points)} remaining")
+
+    def finish_geofence_edit(self):
+        if not self.editing_geofence or len(self.geofence_points) < 3:
+            return
+        if len(set(self.geofence_points)) < 3:
+            QMessageBox.warning(
+                self,
+                "Incomplete fence",
+                "A custom fence needs at least three distinct points.",
+            )
+            return
+        area = abs(
+            sum(
+                x1 * y2 - x2 * y1
+                for (x1, y1), (x2, y2) in zip(
+                    self.geofence_points,
+                    self.geofence_points[1:] + self.geofence_points[:1],
+                )
+            )
+        ) / 2
+        if area <= 1e-6:
+            QMessageBox.warning(
+                self,
+                "Incomplete fence",
+                "The fence points must enclose an area. Add or reposition a point.",
+            )
+            return
+        self.editing_geofence = False
+        self.worker.set_geofence(self.geofence_enabled, self.geofence_points)
+        self.edit_fence_btn.setChecked(False)
+        self._save_geofence_settings()
+        self._update_fence_edit_controls()
+        self._refresh_geofence_status()
+        self.append_log(
+            f"> GEOFENCE  custom polygon saved  {len(self.geofence_points)} vertices"
+        )
+
+    def _save_geofence_settings(self):
+        self.settings.setValue("geofence/points", json.dumps(self.geofence_points))
+        self.settings.sync()
+        if self.settings.status() != QSettings.NoError:
+            self.append_log("> GEOFENCE SETTINGS SAVE FAILED")
+            QMessageBox.warning(
+                self,
+                "Geofence settings",
+                "Could not save the geofence settings. The current fence remains active "
+                "for this session.",
+            )
 
     def toggle_pause(self, paused: bool):
         self.worker.paused = paused
@@ -1253,16 +1673,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(bool, str)
     def on_geofence_alert(self, active: bool, message: str):
-        if active:
-            self.warning_label.setText(message)
-            self.warning_label.setStyleSheet(
-                "background:#7f1d1d; color:#ffffff; padding:7px; font-weight:700;"
-            )
-        else:
-            self.warning_label.setText("GEOFENCE CLEAR")
-            self.warning_label.setStyleSheet(
-                "background:#18351f; color:#83d58e; padding:7px; font-weight:700;"
-            )
+        self._refresh_geofence_status(active, message)
 
     @pyqtSlot(dict)
     def on_forensic_saved(self, entry: dict):
@@ -1293,7 +1704,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def on_status(self, text: str):
-        self.status_label.setText(text)
+        self.feed_status_text = text
+        self._style_feed_status()
         self.append_log(f"> STATUS  {text}")
 
     @pyqtSlot(list)
@@ -1317,6 +1729,9 @@ class MainWindow(QMainWindow):
     def on_telemetry(self, tel: dict):
         lock = f"LOCK {tel['locked']}" if tel["locked"] is not None else "NO LOCK"
         self.stats_label.setText(f"FPS {tel['fps']:.0f}   TRACKS {tel['tracks']}   {lock}")
+        self.stats_label.setAccessibleDescription(
+            f"{tel['fps']:.0f} frames per second, {tel['tracks']} active tracks, {lock.lower()}"
+        )
 
     def lock_from_table(self, row: int, _col: int):
         item = self.track_table.item(row, 0)
